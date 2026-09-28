@@ -4,7 +4,8 @@
 
 // Auto-cycling eye style controller for Monster M4SK.
 // Every 2 minutes, advances to the next eye style and reboots.
-// Uses .noinit RAM to persist the cycle index across soft resets
+// Also triggers on nose boop or covering the light sensor.
+// Cycle state persists across soft resets via SAMD51 RTC backup registers
 // (resets to style 0 on power cycle).
 //
 // Serial commands at 115200 baud:
@@ -20,7 +21,9 @@
 #include "globals.h"
 #include <string.h>
 
-extern uint32_t frames; // Defined in M4_Eyes.ino
+extern uint32_t frames;  // Defined in M4_Eyes.ino
+extern bool     booped;  // Defined in M4_Eyes.ino
+extern Adafruit_Arcada arcada; // Defined via globals.h GLOBAL_VAR
 
 // Eye style name to config path mapping
 struct StyleEntry {
@@ -78,6 +81,20 @@ static void saveCycleState(void) {
 // Auto-cycle timer
 static unsigned long lastCycleMs  = 0;
 static const unsigned long CYCLE_MS = 120000; // 2 minutes
+
+// Sensor trigger state
+static unsigned long bootMs        = 0;      // millis() at boot, skip sensors briefly
+static const unsigned long SENSOR_GRACE_MS = 5000; // Ignore sensors for 5s after boot
+
+// Nose boop detection (rising edge of 'booped' global)
+static bool prevBooped = false;
+
+// Light sensor cover detection
+static unsigned long lastLightMs   = 0;
+static const unsigned long LIGHT_POLL_MS = 200; // Poll seesaw every 200ms
+static const uint16_t LIGHT_COVER_THRESH = 50;  // Below this = covered (0-1023 range)
+static uint8_t darkCount           = 0;          // Consecutive dark readings
+static bool    wasDark             = false;       // Already triggered on this cover
 
 // Serial input buffer
 static char    serialBuf[64];
@@ -159,15 +176,58 @@ void user_setup(void) {
   Serial.printf("Eye style: %s (%d/%d) autocycle=%s\n",
                 styleTable[cycleIndex].name, cycleIndex, NUM_STYLES,
                 cycleEnabled ? "on (2 min)" : "off");
-  Serial.println("Commands: MOOD:<name|list|next>, STATUS, AUTOCYCLE:<on|off>");
-  lastCycleMs = millis();
+  Serial.println("Triggers: nose boop, cover light sensor, 2-min timer, serial");
+  bootMs = millis();
+  lastCycleMs = bootMs;
 }
 
 void user_loop(void) {
-  // Auto-cycle timer: reboot into next style
-  if (cycleEnabled && (millis() - lastCycleMs >= CYCLE_MS)) {
+  unsigned long now = millis();
+  bool sensorsReady = (now - bootMs >= SENSOR_GRACE_MS);
+
+  // During grace period, track sensor baselines so we don't false-trigger
+  // immediately after grace ends (e.g., sensor already covered at boot).
+  if (!sensorsReady) {
+    prevBooped = booped;
+    if (now - lastLightMs >= LIGHT_POLL_MS) {
+      lastLightMs = now;
+      uint16_t reading = arcada.readLightSensor();
+      if (reading <= 1023 && reading < LIGHT_COVER_THRESH) {
+        wasDark = true; // Already dark at boot, don't trigger
+      }
+    }
+  }
+
+  // --- Nose boop: rising edge triggers next style ---
+  if (sensorsReady && booped && !prevBooped) {
+    Serial.println("TRIGGER:boop");
     rebootToStyle(cycleIndex + 1);
-    // Won't reach here
+  }
+  prevBooped = booped;
+
+  // --- Light sensor: covering triggers next style ---
+  if (sensorsReady && (now - lastLightMs >= LIGHT_POLL_MS)) {
+    lastLightMs = now;
+    uint16_t reading = arcada.readLightSensor();
+    if (reading <= 1023) { // Valid I2C read
+      if (reading < LIGHT_COVER_THRESH) {
+        if (darkCount < 255) darkCount++;
+        if (!wasDark && darkCount >= 3) { // 3 consecutive dark readings
+          wasDark = true;
+          Serial.println("TRIGGER:light_cover");
+          rebootToStyle(cycleIndex + 1);
+        }
+      } else {
+        darkCount = 0;
+        wasDark = false;
+      }
+    }
+  }
+
+  // --- Auto-cycle timer: reboot into next style ---
+  if (cycleEnabled && (now - lastCycleMs >= CYCLE_MS)) {
+    Serial.println("TRIGGER:timer");
+    rebootToStyle(cycleIndex + 1);
   }
 
   // Non-blocking serial read
